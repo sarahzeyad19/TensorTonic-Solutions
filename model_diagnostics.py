@@ -20,7 +20,7 @@ DATA SETUP (as agreed):
 Run in Spyder -> prints tables and pops every figure. All PNGs saved at 300 dpi.
 Requirements: pandas numpy scikit-learn lightgbm xgboost catboost shap scipy matplotlib openpyxl
 """
-import os, glob, warnings
+import os, glob, re, warnings
 warnings.filterwarnings("ignore")
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from matplotlib import rcParams
@@ -54,11 +54,14 @@ JMF_RAW = ["Va","VMA","VFA","Pbe","Pba","Gse","Gmm","AC","Dust_Pbe","Gmm_Ni","Gm
            "Pass_3_8in","Pass_No_4","Pass_No_8","Pass_No_16","Pass_No_30","Pass_No_50",
            "Pass_No_100","Pass_No_200","MixTemp","AC_from_RAP","NMAS_mm"]
 ENG = {
-  # rutting: traffic + aggregate skeleton + binder + densification
+  # rutting: binder PG (high temp) + traffic + aggregate skeleton + binder + densification
+  # PG only 20% covered -> net-negative for RUT here; kept lean. Add PG_High/Polymer once
+  # binder grade is backfilled to full coverage (then rutting will benefit strongly).
   "RUT":["NMAS_mm","Pass_No_4","Pass_No_8","Pass_No_30","Intermediate_Frac","Fine_Fraction",
          "Va","VMA","Gse","AC","Pba","RAP_Binder_Ratio","CAA","FAA","Gmm_Nm"],
-  # scb: binder availability + mastic + fine gradation + aggregate quality
-  "SCB":["Gse","Gsb","VMA","VFA","VMA_Filled_Index","Va","Absorption","FlatElong","FAA",
+  # scb: binder PG (modification/low temp) + binder availability + mastic + fine gradation
+  "SCB":["PG_High","PG_Low","Polymer","PG_span","PG_known","AC_Correction",
+         "Gse","Gsb","VMA","VFA","VMA_Filled_Index","Va","Absorption","FlatElong","FAA",
          "SandEq","Pass_No_16","Pass_No_30","Pass_No_50","Fine_Fraction","Pbe","Pba",
          "RAP_Binder_Ratio","AFT_micron"],
 }
@@ -100,6 +103,22 @@ def build_features(df):
         X[s]=pick(df,P+s)
     X["ADT"]=pick(df,"ADT");X["MixTemp"]=pick(df,"Mix_Temperature");X["AC_from_RAP"]=pick(df,"Total_AC_From_RAP")
     X["NMAS_mm"]=df["Nominal_Aggregate_Size"].map(NMAS_MAP)
+    # ---- newly added JMF fields (Tier-2) ----
+    X["Production_Rate"]=pick(df,"Production_Rate")
+    X["AC_Correction"]=pick(df,"AC_Correction_Factor")
+    X["ApparentGravity"]=pick(df,"Combined_Aggregate_Apparent_Gravity")
+    X["Adjustment_Factor"]=pick(df,"Adjustment_Factor")
+    # ---- PG grade + modifier parsed from the Custom_Name text (e.g. "PG 67-22", "SBS") ----
+    def _pg(nm):
+        s=str(nm).upper(); m=re.search(r'(\d{2,3})\s*[-–]\s*(\d{2})',s)
+        hi=float(m.group(1)) if m else np.nan; lo=-float(m.group(2)) if m else np.nan
+        mod=1.0 if re.search(r'SBS|POLY|LATEX|MODIF|ELVALOY|PPA|GTR|RUBBER',s) else 0.0
+        return hi,lo,mod
+    if "Custom_Name" in df.columns:
+        pg=df["Custom_Name"].apply(_pg)
+        X["PG_High"]=[p[0] for p in pg]; X["PG_Low"]=[p[1] for p in pg]; X["Polymer"]=[p[2] for p in pg]
+        X["PG_span"]=X["PG_High"]-X["PG_Low"]
+        X["PG_known"]=X["PG_High"].notna().astype(float)   # flag: is PG grade available?
     for c in ["Design_Level","Mix_Type"]:
         d=pd.get_dummies(df[c].astype(str),prefix=c).astype(float); X=pd.concat([X,d.set_index(X.index)],axis=1)
     X["RAP_Binder_Ratio"]=X["AC_from_RAP"]/X["AC"].replace(0,np.nan)
@@ -144,6 +163,8 @@ def load_target(path,sheet,tgt,ylo,yhi,target):
     X=X.replace([np.inf,-np.inf],np.nan)
     agg=X.groupby("__g__").mean(numeric_only=True).reset_index()   # REMOVE DUPLICATES: one row per exact mix
     y=agg.pop("__y__").values; agg.pop("__g__")
+    for pgc in ["PG_High","PG_Low","PG_span"]:               # sentinel-fill PG (mostly missing), gated by PG_known
+        if pgc in agg.columns: agg[pgc]=agg[pgc].fillna(0.0)
     agg=agg.fillna(agg.median(numeric_only=True)).fillna(0.0)
     agg=agg[select_features(list(agg.columns), target)]      # apply FEATURE_MODE
     agg=agg.loc[:, agg.nunique()>1]                          # drop constant cols (HistGB-safe)
