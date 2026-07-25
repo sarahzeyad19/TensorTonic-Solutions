@@ -39,11 +39,29 @@ import shap
 
 # ============================== CONFIG =======================================
 FILE         = "Book1._rutting__scb_design_validation_xlsx.xlsx"
-FEATURE_MODE = "full"     # "full" (physics+context)  or  "physics" (physics-only)
+# FEATURE_MODE: "engineering" (curated per-target set, RECOMMENDED) |
+#               "full" (all ~62) | "jmf" (30 raw JMF only) | "physics" (drop context)
+FEATURE_MODE = "engineering"
+INCLUDE_CONTEXT_IN_ENGINEERING = True   # add ADT + Mix_Type/Design_Level to the curated set
 CV_FOLDS     = 10
 RANDOM       = 42
 # target caps (same as the reliable benchmark: RUT 0.50-9.29, SCB 0.30-1.45)
 CAP          = {"RUT":(0.5,10.0), "SCB":(0.30,1.60)}
+
+# ---- curated engineering feature sets (from the SHAP + ablation study) ------
+JMF_RAW = ["Va","VMA","VFA","Pbe","Pba","Gse","Gmm","AC","Dust_Pbe","Gmm_Ni","Gmm_Nm",
+           "Absorption","FAA","CAA","SandEq","FlatElong","Gsb","Pass_3_4in","Pass_1_2in",
+           "Pass_3_8in","Pass_No_4","Pass_No_8","Pass_No_16","Pass_No_30","Pass_No_50",
+           "Pass_No_100","Pass_No_200","MixTemp","AC_from_RAP","NMAS_mm"]
+ENG = {
+  # rutting: traffic + aggregate skeleton + binder + densification
+  "RUT":["NMAS_mm","Pass_No_4","Pass_No_8","Pass_No_30","Intermediate_Frac","Fine_Fraction",
+         "Va","VMA","Gse","AC","Pba","RAP_Binder_Ratio","CAA","FAA","Gmm_Nm"],
+  # scb: binder availability + mastic + fine gradation + aggregate quality
+  "SCB":["Gse","Gsb","VMA","VFA","VMA_Filled_Index","Va","Absorption","FlatElong","FAA",
+         "SandEq","Pass_No_16","Pass_No_30","Pass_No_50","Fine_Fraction","Pbe","Pba",
+         "RAP_Binder_Ratio","AFT_micron"],
+}
 FAST         = False      # True = subsample + light models (smoke test)
 HEADLESS     = False      # Spyder: keep False so plots show
 OUTDIR       = "."
@@ -96,7 +114,22 @@ def build_features(df):
     return X
 def context_cols(cols):
     return [c for c in cols if c.startswith("Design_Level_") or c.startswith("Mix_Type_") or c=="ADT"]
-def load_target(path,sheet,tgt,ylo,yhi):
+def select_features(cols, target):
+    """pick columns per FEATURE_MODE (target-aware for 'engineering')"""
+    if FEATURE_MODE=="full":
+        return cols
+    if FEATURE_MODE=="physics":
+        return [c for c in cols if c not in context_cols(cols)]
+    if FEATURE_MODE=="jmf":
+        return [c for c in JMF_RAW if c in cols]
+    if FEATURE_MODE=="engineering":
+        keep=[c for c in ENG.get(target,[]) if c in cols]
+        if INCLUDE_CONTEXT_IN_ENGINEERING:
+            keep=keep+[c for c in cols if c.startswith("Mix_Type_") or c.startswith("Design_Level_")]
+            if "ADT" in cols: keep=keep+["ADT"]
+        return list(dict.fromkeys(keep))
+    return cols
+def load_target(path,sheet,tgt,ylo,yhi,target):
     df=pd.read_excel(path,sheet_name=sheet); y=num(df[tgt]); X=build_features(df)
     # exact-mix key
     ident=[c for c in ["Mix_ID","Design_Level"] if c in df]
@@ -112,8 +145,7 @@ def load_target(path,sheet,tgt,ylo,yhi):
     agg=X.groupby("__g__").mean(numeric_only=True).reset_index()   # REMOVE DUPLICATES: one row per exact mix
     y=agg.pop("__y__").values; agg.pop("__g__")
     agg=agg.fillna(agg.median(numeric_only=True)).fillna(0.0)
-    if FEATURE_MODE=="physics":
-        agg=agg.drop(columns=context_cols(agg.columns))
+    agg=agg[select_features(list(agg.columns), target)]      # apply FEATURE_MODE
     if FAST:
         rng=np.random.RandomState(RANDOM); idx=rng.choice(len(agg),min(500,len(agg)),replace=False)
         agg,y=agg.iloc[idx].reset_index(drop=True),y[idx]
@@ -145,10 +177,11 @@ def new_zoo(): return zoo()
 # ============================== CORE COMPUTE =================================
 def compute(path, name, sheet, tgt, unit):
     print("\n"+"="*70+f"\n  {name}   (FEATURE_MODE={FEATURE_MODE})\n"+"="*70)
-    ylo,yhi=CAP[name.split()[0]]
-    X,y=load_target(path,sheet,tgt,ylo,yhi); feats=list(X.columns)
+    key=name.split()[0]; ylo,yhi=CAP[key]
+    X,y=load_target(path,sheet,tgt,ylo,yhi,key); feats=list(X.columns)
     print(f"  rows after removing duplicates (one per exact mix)={len(X)}  "
           f"features={X.shape[1]}  target range=[{y.min():.2f},{y.max():.2f}]")
+    print(f"  features used: {feats}")
     ybin=pd.qcut(y,10,labels=False,duplicates="drop")
     cv10=list(StratifiedKFold(CV_FOLDS,shuffle=True,random_state=RANDOM).split(X,ybin))
     cv3 =list(StratifiedKFold(3,shuffle=True,random_state=RANDOM).split(X,ybin))
