@@ -25,6 +25,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.inspection import permutation_importance
 import lightgbm as lgb
 from catboost import CatBoostRegressor
+import shap
 
 # ------------------------------------------------------------------ CONFIG
 # >>> EDIT THIS to the path of the workbook on your machine <<<
@@ -217,8 +218,19 @@ def run_target(name, sheet, target_col, log_target, ylo, yhi):
                                  n_repeats=10, random_state=RANDOM, n_jobs=-1)
     imp_s = pd.Series(imp.importances_mean, index=feat_names).sort_values(ascending=False)
 
+    # ---- SHAP (TreeExplainer on the LightGBM member of the blend) -----------
+    explainer   = shap.TreeExplainer(final["LightGBM"])
+    shap_values = explainer.shap_values(Xte)               # (n_test, n_features)
+    shap_mean   = pd.Series(np.abs(shap_values).mean(0),
+                            index=feat_names).sort_values(ascending=False)
+    print("\n  --- SHAP top-10 (mean |SHAP|) ---")
+    for k, v in shap_mean.head(10).items():
+        print(f"    {k:20s} {v:.4f}")
+
     return dict(name=name, y_test=yte, p_test=test_pred, oof_true=y[tr_idx],
-                oof_pred=oof_orig, fold_r2=fold_r2, imp=imp_s, mt=mt, mo=mo)
+                oof_pred=oof_orig, fold_r2=fold_r2, imp=imp_s, mt=mt, mo=mo,
+                shap_values=shap_values, X_shap=Xte, shap_mean=shap_mean,
+                feat_names=feat_names)
 
 # ------------------------------------------------------------------ plotting
 def plot_target(R):
@@ -255,6 +267,29 @@ def plot_target(R):
     fig.savefig(f"{OUTDIR}/{name.replace(' ','_')}_results.png",dpi=120)
     return fig
 
+def plot_shap(R):
+    """dedicated SHAP figure: beeswarm (direction) + mean|SHAP| bar (magnitude)"""
+    name = R["name"]
+    fig = plt.figure(figsize=(15,7))
+    fig.suptitle(f"{name}  |  SHAP explanations (locked-test set)",
+                 fontsize=14, fontweight="bold")
+    # left: beeswarm  -> shows feature effect direction & spread
+    ax1 = fig.add_subplot(1,2,1)
+    plt.sca(ax1)
+    shap.summary_plot(R["shap_values"], R["X_shap"], plot_type="dot",
+                      max_display=15, show=False, plot_size=None)
+    ax1.set_title("Beeswarm (impact & direction)")
+    # right: mean |SHAP| bar -> global importance ranking
+    ax2 = fig.add_subplot(1,2,2)
+    top = R["shap_mean"].head(15)[::-1]
+    ax2.barh(top.index, top.values, color="#3182bd", edgecolor="k")
+    ax2.set_title("Mean |SHAP| (global importance)")
+    ax2.set_xlabel("mean |SHAP value|")
+    fig.tight_layout(rect=[0,0,1,0.95])
+    fig.savefig(f"{OUTDIR}/{name.replace(' ','_')}_SHAP.png", dpi=120,
+                bbox_inches="tight")
+    return fig
+
 # ------------------------------------------------------------------ MAIN
 if __name__ == "__main__":
     results = []
@@ -262,7 +297,8 @@ if __name__ == "__main__":
                               log_target=True,  ylo=0.5, yhi=10.0))
     results.append(run_target("SCB", "SCB_Design", "SCB_Result",
                               log_target=False, ylo=0.30, yhi=1.60))
-    figs=[plot_target(R) for R in results]
+    figs  = [plot_target(R) for R in results]
+    shaps = [plot_shap(R)   for R in results]
     if not HEADLESS:
         plt.show()
-    print("\nDONE - plots saved as PNG and shown.")
+    print("\nDONE - result + SHAP plots saved as PNG and shown.")
