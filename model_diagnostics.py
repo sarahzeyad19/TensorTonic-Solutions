@@ -31,7 +31,7 @@ from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.svm import SVR
 from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor)
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import lightgbm as lgb, xgboost as xgb
 from catboost import CatBoostRegressor
@@ -42,6 +42,8 @@ FILE         = "Book1._rutting__scb_design_validation_xlsx.xlsx"
 FEATURE_MODE = "full"     # "full" (physics+context)  or  "physics" (physics-only)
 CV_FOLDS     = 10
 RANDOM       = 42
+# target caps (same as the reliable benchmark: RUT 0.50-9.29, SCB 0.30-1.45)
+CAP          = {"RUT":(0.5,10.0), "SCB":(0.30,1.60)}
 FAST         = False      # True = subsample + light models (smoke test)
 HEADLESS     = False      # Spyder: keep False so plots show
 OUTDIR       = "."
@@ -94,7 +96,7 @@ def build_features(df):
     return X
 def context_cols(cols):
     return [c for c in cols if c.startswith("Design_Level_") or c.startswith("Mix_Type_") or c=="ADT"]
-def load_target(path,sheet,tgt):
+def load_target(path,sheet,tgt,ylo,yhi):
     df=pd.read_excel(path,sheet_name=sheet); y=num(df[tgt]); X=build_features(df)
     # exact-mix key
     ident=[c for c in ["Mix_ID","Design_Level"] if c in df]
@@ -105,9 +107,9 @@ def load_target(path,sheet,tgt):
         if ks[c].dtype.kind in "fc": ks[c]=num(ks[c]).round(2)
     grp=np.array([str(v) for v in ks.apply(lambda col:col.map(str)).agg("|".join,axis=1)],dtype=object)
     X["__y__"]=y; X["__g__"]=grp
-    X=X[np.isfinite(X["__y__"])&(X["__y__"]>0)]                 # NO range cap; drop invalid only
+    X=X[np.isfinite(X["__y__"])&(X["__y__"]>=ylo)&(X["__y__"]<=yhi)]   # drop invalid + cap (reliable ranges)
     X=X.replace([np.inf,-np.inf],np.nan)
-    agg=X.groupby("__g__").mean(numeric_only=True).reset_index()   # one row per exact mix
+    agg=X.groupby("__g__").mean(numeric_only=True).reset_index()   # REMOVE DUPLICATES: one row per exact mix
     y=agg.pop("__y__").values; agg.pop("__g__")
     agg=agg.fillna(agg.median(numeric_only=True)).fillna(0.0)
     if FEATURE_MODE=="physics":
@@ -143,33 +145,39 @@ def new_zoo(): return zoo()
 # ============================== CORE COMPUTE =================================
 def compute(path, name, sheet, tgt, unit):
     print("\n"+"="*70+f"\n  {name}   (FEATURE_MODE={FEATURE_MODE})\n"+"="*70)
-    X,y=load_target(path,sheet,tgt); feats=list(X.columns)
-    print(f"  exact-mix rows={len(X)}  features={X.shape[1]}  target range=[{y.min():.2f},{y.max():.2f}]")
+    ylo,yhi=CAP[name.split()[0]]
+    X,y=load_target(path,sheet,tgt,ylo,yhi); feats=list(X.columns)
+    print(f"  rows after removing duplicates (one per exact mix)={len(X)}  "
+          f"features={X.shape[1]}  target range=[{y.min():.2f},{y.max():.2f}]")
     ybin=pd.qcut(y,10,labels=False,duplicates="drop")
-    sgkf=StratifiedGroupKFold(CV_FOLDS,shuffle=True,random_state=RANDOM)
-    groups=np.arange(len(X))                              # one row per mix -> row-level groups
-    # single stratified 80/20 holdout (first fold) for scatter/error/SHAP
-    tr,te=next(StratifiedGroupKFold(5,shuffle=True,random_state=RANDOM).split(X,ybin,groups))
-    Xtr,Xte,ytr,yte=X.iloc[tr],X.iloc[te],y[tr],y[te]
-    # per-model: fit holdout + CV R2 list
-    fit_res={}; cv_r2={}
-    for nm,m in new_zoo().items():
-        m.fit(Xtr,ytr); ptr,pte=m.predict(Xtr),m.predict(Xte)
-        fit_res[nm]=dict(ptr=ptr,pte=pte,
-                         R2_tr=r2_score(ytr,ptr),R2_te=r2_score(yte,pte),
-                         RMSE=np.sqrt(mean_squared_error(yte,pte)),MAE=mean_absolute_error(yte,pte))
-        # CV
-        r2s=[]
-        for a,b in sgkf.split(X,ybin,groups):
-            mm=new_zoo()[nm]; mm.fit(X.iloc[a],y[a]); r2s.append(r2_score(y[b],mm.predict(X.iloc[b])))
-        cv_r2[nm]=np.array(r2s)
-        print(f"    {nm:13s} test R2={fit_res[nm]['R2_te']:.3f}  RMSE={fit_res[nm]['RMSE']:.3f}  CV R2={cv_r2[nm].mean():.3f}+/-{cv_r2[nm].std():.3f}")
-    # SHAP on a fast tree member (LightGBM) over test set
-    lgbm=new_zoo()["LightGBM"]; lgbm.fit(Xtr,ytr)
-    sv=shap.TreeExplainer(lgbm).shap_values(Xte)
+    cv10=list(StratifiedKFold(CV_FOLDS,shuffle=True,random_state=RANDOM).split(X,ybin))
+    cv3 =list(StratifiedKFold(3,shuffle=True,random_state=RANDOM).split(X,ybin))
+    fit_res={}; cv_r2={}; cv3_r2={}
+    for nm in new_zoo():
+        # 10-fold pooled out-of-fold predictions  (honest "test")
+        oof=np.zeros(len(y)); folds=[]
+        for a,b in cv10:
+            m=new_zoo()[nm]; m.fit(X.iloc[a],y[a]); p=m.predict(X.iloc[b]); oof[b]=p
+            folds.append(r2_score(y[b],p))
+        # in-sample fit on all data  (optimistic "train")
+        mm=new_zoo()[nm]; mm.fit(X,y); insample=mm.predict(X)
+        # 3-fold pooled (for ranking-consistency scatter)
+        oof3=np.zeros(len(y))
+        for a,b in cv3:
+            m=new_zoo()[nm]; m.fit(X.iloc[a],y[a]); oof3[b]=m.predict(X.iloc[b])
+        fit_res[nm]=dict(ptr=insample,pte=oof,
+                         R2_tr=r2_score(y,insample),R2_te=r2_score(y,oof),
+                         RMSE=np.sqrt(mean_squared_error(y,oof)),MAE=mean_absolute_error(y,oof))
+        cv_r2[nm]=np.array(folds); cv3_r2[nm]=r2_score(y,oof3)
+        print(f"    {nm:13s} OOF R2={fit_res[nm]['R2_te']:.3f}  RMSE={fit_res[nm]['RMSE']:.3f}  "
+              f"10-fold R2={cv_r2[nm].mean():.3f}+/-{cv_r2[nm].std():.3f}")
+    # SHAP (LightGBM, out-of-fold-style on a sample)
+    samp=np.random.RandomState(RANDOM).choice(len(X),min(900,len(X)),replace=False)
+    lgbm=new_zoo()["LightGBM"]; lgbm.fit(X,y)
+    Xsh=X.iloc[samp]; sv=shap.TreeExplainer(lgbm).shap_values(Xsh)
     shap_mean=pd.Series(np.abs(sv).mean(0),index=feats).sort_values(ascending=False)
-    return dict(name=name,unit=unit,X=X,y=y,feats=feats,tr=tr,te=te,ytr=ytr,yte=yte,
-                fit=fit_res,cv=cv_r2,shap=sv,Xte=Xte,shap_mean=shap_mean)
+    return dict(name=name,unit=unit,X=X,y=y,feats=feats,ytr=y,yte=y,
+                fit=fit_res,cv=cv_r2,cv3=cv3_r2,shap=sv,Xte=Xsh,shap_mean=shap_mean)
 
 # ============================== FIGURES ======================================
 def fig_distribution(R):
@@ -267,16 +275,16 @@ def fig_shap(R):
 
 def fig_spearman(R):
     name=R["name"]; models=list(R["fit"])
-    xv=np.array([R["cv"][m].mean() for m in models])       # CV mean R2
-    yv=np.array([R["fit"][m]["R2_te"] for m in models])    # locked-test R2
+    xv=np.array([R["cv"][m].mean() for m in models])   # 10-fold CV mean R2
+    yv=np.array([R["cv3"][m]        for m in models])  # 3-fold CV R2
     rho=spearmanr(xv,yv).correlation
     fig,ax=plt.subplots(figsize=(7,6.5))
     for m in models:
-        mk,col=STYLE[m]; ax.scatter(R["cv"][m].mean(),R["fit"][m]["R2_te"],marker=mk,s=90,color=col,edgecolor="k",label=m)
+        mk,col=STYLE[m]; ax.scatter(R["cv"][m].mean(),R["cv3"][m],marker=mk,s=90,color=col,edgecolor="k",label=m)
     lo=min(xv.min(),yv.min())-0.05; hi=max(xv.max(),yv.max())+0.05
     ax.plot([lo,hi],[lo,hi],"--",color="grey",lw=1.2)
     ax.set_xlim(lo,hi); ax.set_ylim(lo,hi)
-    ax.set_xlabel(f"{CV_FOLDS}-fold CV mean $R^2$"); ax.set_ylabel("Locked-test $R^2$")
+    ax.set_xlabel(f"{CV_FOLDS}-fold CV mean $R^2$"); ax.set_ylabel("3-fold CV $R^2$")
     ax.set_title(f"{name}: model ranking consistency\nSpearman $\\rho$ = {rho:.3f}")
     ax.legend(fontsize=8,ncol=2)
     fig.tight_layout(); fig.savefig(f"{OUTDIR}/{name}_spearman.png",bbox_inches="tight"); return fig
