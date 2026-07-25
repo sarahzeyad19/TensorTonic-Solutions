@@ -104,7 +104,7 @@ def load_target(path,sheet,tgt,ylo,yhi):
     y=num(df[tgt]); X=build_features(df)
     keep=np.isfinite(y)&(y>=ylo)&(y<=yhi)
     X=X[keep].reset_index(drop=True); y=y[keep].values
-    grp=df.loc[keep,"Mix_ID"].astype(str).values          # KEEP replicates; group = Mix_ID
+    grp=np.array([str(v) for v in df.loc[keep,"Mix_ID"].tolist()], dtype=object)  # KEEP replicates; group=Mix_ID
     X=X.replace([np.inf,-np.inf],np.nan)
     X=X.fillna(X.median(numeric_only=True)).fillna(0.0)
     if FAST:                                               # smoke-test subsample
