@@ -30,7 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.svm import SVR
-from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor)
+from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor, HistGradientBoostingRegressor)
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import lightgbm as lgb, xgboost as xgb
@@ -146,6 +146,7 @@ def load_target(path,sheet,tgt,ylo,yhi,target):
     y=agg.pop("__y__").values; agg.pop("__g__")
     agg=agg.fillna(agg.median(numeric_only=True)).fillna(0.0)
     agg=agg[select_features(list(agg.columns), target)]      # apply FEATURE_MODE
+    agg=agg.loc[:, agg.nunique()>1]                          # drop constant cols (HistGB-safe)
     if FAST:
         rng=np.random.RandomState(RANDOM); idx=rng.choice(len(agg),min(500,len(agg)),replace=False)
         agg,y=agg.iloc[idx].reset_index(drop=True),y[idx]
@@ -160,17 +161,17 @@ def zoo():
         "KNN":        make_pipeline(StandardScaler(),KNeighborsRegressor(n_neighbors=10)),
         "SVR":        make_pipeline(StandardScaler(),SVR(C=10.0,gamma="scale")),
         "RandomForest":RandomForestRegressor(n_estimators=T,n_jobs=-1,random_state=RANDOM),
-        "ExtraTrees": ExtraTreesRegressor(n_estimators=T,n_jobs=-1,random_state=RANDOM),
-        "GradBoost":  GradientBoostingRegressor(n_estimators=min(I,200),learning_rate=0.05,max_depth=3,random_state=RANDOM),
-        "XGBoost":    xgb.XGBRegressor(n_estimators=I,learning_rate=0.04,max_depth=5,subsample=0.85,colsample_bytree=0.8,random_state=RANDOM,n_jobs=-1,verbosity=0),
-        "LightGBM":   lgb.LGBMRegressor(n_estimators=I,learning_rate=0.04,num_leaves=31,subsample=0.85,colsample_bytree=0.8,random_state=RANDOM,n_jobs=-1,verbose=-1),
-        "CatBoost":   CatBoostRegressor(iterations=I,learning_rate=0.04,depth=6,random_state=RANDOM,verbose=0),
+        "ExtraTrees": ExtraTreesRegressor(n_estimators=T,min_samples_leaf=2,max_features=0.85,n_jobs=-1,random_state=RANDOM),
+        "HistGB":     HistGradientBoostingRegressor(max_iter=min(I,650),learning_rate=0.035,max_leaf_nodes=31,min_samples_leaf=20,l2_regularization=0.1,random_state=RANDOM),
+        "XGBoost_reg":xgb.XGBRegressor(n_estimators=min(I,650),learning_rate=0.035,max_depth=4,min_child_weight=5,subsample=0.85,colsample_bytree=0.8,reg_alpha=0.05,reg_lambda=20.0,random_state=RANDOM,n_jobs=-1,verbosity=0),
+        "LightGBM_reg":lgb.LGBMRegressor(n_estimators=min(I,650),learning_rate=0.035,num_leaves=31,min_child_samples=18,subsample=0.85,colsample_bytree=0.8,reg_alpha=0.05,reg_lambda=25.0,random_state=RANDOM,n_jobs=-1,verbose=-1),
+        "CatBoost_reg":CatBoostRegressor(iterations=min(I,650),learning_rate=0.035,depth=5,l2_leaf_reg=20,random_state=RANDOM,verbose=0),
     }
 # distinct marker+color per model (paper style)
 STYLE={"Ridge":("P","#8c564b"),"ElasticNet":("X","#e377c2"),"KNN":("v","#7f7f7f"),
        "SVR":("D","#d62728"),"RandomForest":("^","#2ca02c"),"ExtraTrees":("s","#1f77b4"),
-       "GradBoost":("<","#ff7f0e"),"XGBoost":("o","#9467bd"),"LightGBM":("*","#17becf"),
-       "CatBoost":("h","#bcbd22")}
+       "HistGB":("<","#ff7f0e"),"XGBoost_reg":("o","#9467bd"),"LightGBM_reg":("*","#17becf"),
+       "CatBoost_reg":("h","#bcbd22")}
 
 def new_zoo(): return zoo()
 
@@ -206,7 +207,7 @@ def compute(path, name, sheet, tgt, unit):
               f"10-fold R2={cv_r2[nm].mean():.3f}+/-{cv_r2[nm].std():.3f}")
     # SHAP (LightGBM, out-of-fold-style on a sample)
     samp=np.random.RandomState(RANDOM).choice(len(X),min(900,len(X)),replace=False)
-    lgbm=new_zoo()["LightGBM"]; lgbm.fit(X,y)
+    lgbm=new_zoo()["LightGBM_reg"]; lgbm.fit(X,y)
     Xsh=X.iloc[samp]; sv=shap.TreeExplainer(lgbm).shap_values(Xsh)
     shap_mean=pd.Series(np.abs(sv).mean(0),index=feats).sort_values(ascending=False)
     return dict(name=name,unit=unit,X=X,y=y,feats=feats,ytr=y,yte=y,
